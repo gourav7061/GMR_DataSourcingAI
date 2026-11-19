@@ -1,0 +1,40 @@
+# Environment and Credentials
+.env
+.env.local
+.env*.local
+.streamlit/secrets.toml
+credentials.json
+token.json
+*.pem
+*.key
+
+# Temporary Files
+.tmp/
+*.tmp
+*.temp
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+.claude/
+*.bak
