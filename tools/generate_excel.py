@@ -76,7 +76,8 @@ def _num_format(vals) -> str:
 
 
 def write_workbook(company: str, merged: dict, extractions: list[dict], out_path: Path,
-                   non_gaap_merged: dict | None = None, segments_merged: dict | None = None) -> Path:
+                   non_gaap_merged: dict | None = None, segments_merged: dict | None = None,
+                   guidance_rows: list[dict] | None = None) -> Path:
     wb = Workbook()
     wb.remove(wb.active)
     bold, hdr_fill = Font(bold=True), PatternFill("solid", fgColor="DDE5F0")
@@ -124,6 +125,11 @@ def write_workbook(company: str, merged: dict, extractions: list[dict], out_path
 
         write_segments_sheet(wb, company, segments_merged)
 
+    if guidance_rows is not None:
+        from guidance_excel import write_guidance_sheet
+
+        write_guidance_sheet(wb, company, guidance_rows)
+
     ws = wb.create_sheet("Sources")
     headers = ["Period", "Document type", "Period end", "Source URL", "File"]
     for j, h in enumerate(headers, start=1):
@@ -142,11 +148,16 @@ def write_workbook(company: str, merged: dict, extractions: list[dict], out_path
 
 
 def build(company: str, extractions: list[dict], out_path: Path | None = None,
-          non_gaap: list[dict] | None = None, segments: list[dict] | None = None) -> tuple[Path, dict]:
-    """non_gaap / segments: results of extract_non_gaap.py / extract_segments.py; when given, the result dict
-    also has merged['non_gaap'] / merged['segments']."""
+          non_gaap: list[dict] | None = None, segments: list[dict] | None = None,
+          guidance: list[dict] | None = None) -> tuple[Path, dict]:
+    """non_gaap / segments / guidance: results of extract_non_gaap.py / extract_segments.py / extract_guidance.py;
+    when given, the result dict also has merged['non_gaap'] / merged['segments'] / merged['guidance'] (rows)."""
     merged = merge(extractions)
-    ng_merged = seg_merged = None
+    ng_merged = seg_merged = gd_rows = None
+    if guidance is not None:
+        from guidance_excel import guidance_rows
+
+        gd_rows = guidance_rows(guidance)
     if non_gaap is not None:
         from non_gaap_excel import merge_non_gaap
 
@@ -156,8 +167,9 @@ def build(company: str, extractions: list[dict], out_path: Path | None = None,
 
         seg_merged = merge_segments(segments)
     out_path = out_path or OUTPUT_DIR / f"{safe_filename(company)}_financials.xlsx"
-    path = write_workbook(company, merged, extractions, out_path, ng_merged, seg_merged)
-    extra = {k: v for k, v in (("non_gaap", ng_merged), ("segments", seg_merged)) if v is not None}
+    path = write_workbook(company, merged, extractions, out_path, ng_merged, seg_merged, gd_rows)
+    extra = {k: v for k, v in (("non_gaap", ng_merged), ("segments", seg_merged), ("guidance", gd_rows))
+             if v is not None}
     return path, {**merged, **extra}
 
 
@@ -167,12 +179,15 @@ if __name__ == "__main__":
     ap.add_argument("--out")
     ap.add_argument("--non-gaap", help="non_gaap.json from extract_non_gaap.py")
     ap.add_argument("--segments", help="segments.json from extract_segments.py")
+    ap.add_argument("--guidance", help="guidance.json from extract_guidance.py")
     args = ap.parse_args()
     meta = json.loads(Path(args.extractions_json).read_text(encoding="utf-8"))
     ng = json.loads(Path(args.non_gaap).read_text(encoding="utf-8"))["extractions"] if args.non_gaap else None
     seg = json.loads(Path(args.segments).read_text(encoding="utf-8"))["extractions"] if args.segments else None
-    path, merged = build(meta["company"], meta["extractions"], Path(args.out) if args.out else None, ng, seg)
+    gd = json.loads(Path(args.guidance).read_text(encoding="utf-8"))["extractions"] if args.guidance else None
+    path, merged = build(meta["company"], meta["extractions"], Path(args.out) if args.out else None, ng, seg, gd)
     merged.pop("non_gaap", None)
     merged.pop("segments", None)
+    merged.pop("guidance", None)
     print(json.dumps({"output": str(path), **{k: f"{len(v['rows'])} rows x {len(v['columns'])} periods"
                                                for k, v in merged.items()}}))

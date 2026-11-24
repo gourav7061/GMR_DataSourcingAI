@@ -19,6 +19,8 @@ from generate_excel import SHEETS, build  # noqa: E402
 from non_gaap_excel import EMPTY_MSG, NG_SHEETS, sheet_rows  # noqa: E402
 from extract_segments import extract_segments_one  # noqa: E402
 from segments_excel import EMPTY_MSG as SEG_EMPTY_MSG, SEGMENTS_SHEET, sheet_rows as segment_rows  # noqa: E402
+from extract_guidance import extract_guidance_one  # noqa: E402
+from guidance_excel import COLUMNS as GD_COLUMNS, EMPTY_MSG as GD_EMPTY_MSG, GUIDANCE_SHEET  # noqa: E402
 
 UPLOAD_TYPES = ["pdf", "xlsx", "xlsm", "csv", "htm", "html"]
 # the IR-URL mode needs a visible browser window, which cloud hosts (Linux, no display) can't open
@@ -54,7 +56,7 @@ if app_password and not st.session_state.get("authenticated"):
     st.stop()
 st.title("Financial statements extractor")
 st.caption("Extracts the income statement, balance sheet and cash flow, plus GAAP to non-GAAP reconciliations "
-           "and revenue segments, from quarterly and annual reports into one Excel workbook, "
+           "revenue segments and guidance, from quarterly and annual reports into one Excel workbook, "
            "with every period as a column.")
 
 try:
@@ -86,18 +88,21 @@ def run_extraction(docs: list[dict], company: str | None, reuse: bool, status, l
     ok, failed, cost = [], [], 0.0
     ng_ok, ng_failed = [], []
     seg_ok, seg_failed = [], []
+    gd_ok, gd_failed = [], []
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(extract_one, d, client, not reuse, log): ("statements", d) for d in docs}
         futures.update({pool.submit(extract_non_gaap_one, d, client, not reuse, log): ("non_gaap", d)
                         for d in docs})
         futures.update({pool.submit(extract_segments_one, d, client, not reuse, log): ("segments", d)
                         for d in docs})
+        futures.update({pool.submit(extract_guidance_one, d, client, not reuse, log): ("guidance", d)
+                        for d in docs})
         for i, fut in enumerate(as_completed(futures), start=1):
             kind, d = futures[fut]
             name = d.get("file_name") or d["period_label"]
             try:
                 r = fut.result()
-                {"statements": ok, "non_gaap": ng_ok, "segments": seg_ok}[kind].append(r)
+                {"statements": ok, "non_gaap": ng_ok, "segments": seg_ok, "guidance": gd_ok}[kind].append(r)
                 cost += r["cost_usd"]
             except Exception as e:
                 if kind == "statements":
@@ -106,22 +111,31 @@ def run_extraction(docs: list[dict], company: str | None, reuse: bool, status, l
                 elif kind == "non_gaap":
                     ng_failed.append((name, str(e)))
                     log(f"FAILED non-GAAP {name}: {e}")
-                else:
+                elif kind == "segments":
                     seg_failed.append((name, str(e)))
                     log(f"FAILED segments {name}: {e}")
+                else:
+                    gd_failed.append((name, str(e)))
+                    log(f"FAILED guidance {name}: {e}")
             log.flush()
             progress.progress(i / len(futures))
     if not ok:
         raise RuntimeError("No report could be extracted.")
+    # the guidance pass runs in parallel, so it can't see a new file's period yet: take it from the statements result
+    periods = {r["source"]["file"]: r["source"] for r in ok}
+    for g in gd_ok:
+        s = periods.get(g["source"]["file"])
+        if s and s.get("period_end"):
+            g["source"].update(period_end=s["period_end"], period_label=s["period_label"])
     if not company:
         names = Counter(r["company"] for r in ok if r.get("company"))
         company = names.most_common(1)[0][0] if names else "Company"
         if len(names) > 1:
             log(f"Note: the files name more than one company ({', '.join(names)}); using '{company}'.")
             log.flush()
-    path, merged = build(company, ok, non_gaap=ng_ok, segments=seg_ok)
+    path, merged = build(company, ok, non_gaap=ng_ok, segments=seg_ok, guidance=gd_ok)
     st.session_state.results = {"path": str(path), "merged": merged, "failed": failed, "ng_failed": ng_failed,
-                                "seg_failed": seg_failed, "cost": cost, "n": len(ok)}
+                                "seg_failed": seg_failed, "gd_failed": gd_failed, "cost": cost, "n": len(ok)}
     status.update(label=f"Done: {len(ok)} reports extracted, Claude cost ${cost:.2f}", state="complete")
 
 
@@ -150,8 +164,20 @@ def show_results():
         st.warning(f"Non-GAAP measures from {label} were not extracted: {err}")
     for label, err in res.get("seg_failed", []):
         st.warning(f"Revenue segments from {label} were not extracted: {err}")
-    tabs = st.tabs(list(SHEETS.values()) + list(NG_SHEETS.values()) + [SEGMENTS_SHEET])
-    seg, seg_tab = res["merged"].get("segments"), tabs[-1]
+    for label, err in res.get("gd_failed", []):
+        st.warning(f"Guidance from {label} was not extracted: {err}")
+    tabs = st.tabs(list(SHEETS.values()) + list(NG_SHEETS.values()) + [SEGMENTS_SHEET, GUIDANCE_SHEET])
+    gd_rows, gd_tab = res["merged"].get("guidance") or [], tabs[-1]
+    if not gd_rows:
+        gd_tab.info(GD_EMPTY_MSG)
+    else:
+        gd_tab.caption("One row per forward-looking statement and report, as published. "
+                       "Rows of the same metric and period from different reports show how guidance changed.")
+        gd_tab.dataframe(pd.DataFrame([[r.get(k) for _, k, _ in GD_COLUMNS] for r in gd_rows],
+                                      columns=[h for h, _, _ in GD_COLUMNS]),
+                         hide_index=True, use_container_width=True, height=600,
+                         column_config={"Quote": st.column_config.TextColumn(width="large")})
+    seg, seg_tab = res["merged"].get("segments"), tabs[len(SHEETS) + len(NG_SHEETS)]
     seg_rows = segment_rows(seg) if seg else []
     if not seg_rows:
         seg_tab.info(SEG_EMPTY_MSG)
@@ -208,7 +234,8 @@ with upload_tab:
                                    for d in docs]), hide_index=True, use_container_width=True)
         st.caption(f"{len(docs)} file{'s' if len(docs) != 1 else ''}. Rough cost: about \\$0.10-\\$0.40 per results "
                    f"announcement, more for full annual reports, plus about \\$0.05-\\$0.25 for non-GAAP "
-                   f"reconciliations and \\$0.10-\\$0.30 for revenue segments where present. "
+                   f"reconciliations, \\$0.10-\\$0.30 for revenue segments and \\$0.10-\\$0.30 for guidance "
+                   f"where present. "
                    f"Files extracted before are free. "
                    f"The period of each file is detected automatically.")
     if st.button("Extract", type="primary", disabled=not docs, key="extract_up"):
@@ -253,7 +280,8 @@ def url_mode():
         selected = [d for d, keep in zip(url_docs, edited["Extract"]) if keep]
         st.caption(f"{len(selected)} selected. Rough cost: about \\$0.10-\\$0.40 per results announcement, "
                    f"more for full annual reports, plus about \\$0.05-\\$0.25 for non-GAAP reconciliations "
-                   f"and \\$0.10-\\$0.30 for revenue segments where present. Cached extractions are free.")
+                   f"\\$0.10-\\$0.30 for revenue segments and \\$0.10-\\$0.30 for guidance where present. "
+                   f"Cached extractions are free.")
 
         if st.button("2. Download and extract", type="primary", disabled=not selected):
             with st.status("Downloading reports...", expanded=True) as status:

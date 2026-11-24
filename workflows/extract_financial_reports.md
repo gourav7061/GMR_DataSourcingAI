@@ -1,7 +1,7 @@
 # Workflow: Extract Financial Statements from an Investor-Relations Page
 
 ## Objective
-Given a company's investor-relations (IR) page URL, or uploaded reports, find its quarterly, interim and annual reports, download them, and build one Excel workbook with Income Statement, Balance Sheet and Cash Flow sheets, plus GAAP/non-GAAP reconciliations and revenue segments. Each sheet has all periods as columns.
+Given a company's investor-relations (IR) page URL, or uploaded reports, find its quarterly, interim and annual reports, download them, and build one Excel workbook with Income Statement, Balance Sheet and Cash Flow sheets, plus GAAP/non-GAAP reconciliations, revenue segments and a log of forward-looking guidance. Each data sheet has all periods as columns.
 
 ## Inputs
 - IR page URL, i.e. the page that lists results (e.g. `https://ir.mi.com/financial-information/quarterly-results`)
@@ -9,11 +9,12 @@ Given a company's investor-relations (IR) page URL, or uploaded reports, find it
 - Cache choices: reuse downloaded files, and reuse previous extractions
 
 ## Outputs
-- `.tmp/output/<Company>_financials.xlsx` with the sheets Income Statement, Balance Sheet, Cash Flow, GAAP Measures, Non-GAAP Measures, Revenue Segments and Sources. The Streamlit app also offers it as a download.
+- `.tmp/output/<Company>_financials.xlsx` with the sheets Income Statement, Balance Sheet, Cash Flow, GAAP Measures, Non-GAAP Measures, Revenue Segments, Guidance and Sources. The Streamlit app also offers it as a download.
   - **GAAP Measures:** the as-reported line (and margin) of every measure the company reconciles to non-GAAP.
   - **Non-GAAP Measures:** a Summary block (each non-GAAP/adjusted line) and a Reconciliations block (GAAP line, then each adjustment, then the non-GAAP line, per measure).
   - **Revenue Segments:** one block per breakdown: "By business segment" (segments, with product lines nested under them), "By geography", and any other disclosed split. Each block has Revenue, Gross profit and Gross margin (%) sub-blocks where disclosed. Published figures only; nothing is calculated.
-- Intermediates (disposable): `.tmp/reports/<site>/` (downloaded files + `manifest.json` + `documents.json`) and `.tmp/extractions/` (`<hash>_v1.json` for statements, `<hash>_nongaap_v1.json` for non-GAAP, `<hash>_segments_v1.json` for segments)
+  - **Guidance:** a log with one row per forward-looking statement per report. Columns: Category (financial / operational / esg / other), Metric, Segment, Guided period, Type (range / point / minimum / maximum / growth / qualitative), Low, High, Unit, Basis, Status (as stated: raised / lowered / reiterated / achieved / new), Issued in, Report period end, Source file, Page, verbatim Quote. Rows are sorted so that the same target from different reports sits together, which shows the revision trail. The header row has an autofilter.
+- Intermediates (disposable): `.tmp/reports/<site>/` (downloaded files + `manifest.json` + `documents.json`) and `.tmp/extractions/` (`<hash>_v1.json` for statements, `<hash>_nongaap_v1.json` for non-GAAP, `<hash>_segments_v1.json` for segments, `<hash>_guidance_v1.json` for guidance)
 
 ## Setup (once)
 ```
@@ -36,16 +37,19 @@ Add `ANTHROPIC_API_KEY=sk-ant-...` to `.env`.
    - `tools/extract_financials.py` sends each report to Claude (`claude-opus-5-5`, effort `medium`) with a JSON schema. For PDFs, only pages whose top lines carry a statement title (plus the page after each) are sent.
    - `tools/extract_non_gaap.py` runs in parallel as a separate second pass (both modes, always on). It sends only pages mentioning non-GAAP / non-IFRS / adjusted measures (full-page text search, max 30 pages). A file with no such wording gets no Claude call ($0). The statements pass is not affected by it; if it fails, the app shows a warning and still builds the workbook.
    - `tools/extract_segments.py` runs in parallel as a third pass (both modes, always on). It sends only pages that mention segments / revenue breakdowns **and** carry a table (at least 8 comma-grouped numbers), plus the next page, max 30 pages. A file with no such page gets no Claude call ($0). The other passes are not affected by it; a failure becomes a warning.
-   - `tools/generate_excel.py` merges all extractions and writes the workbook (the non-GAAP sheets come from `tools/non_gaap_excel.py`, the segment sheet from `tools/segments_excel.py`).
+   - `tools/extract_guidance.py` runs in parallel as a fourth pass (both modes, always on). Guidance is narrative and scattered, so it sends the document's **text** with `[Page N]` markers, not a PDF. Documents up to 300k characters are sent whole (about $0.10 of input for a results announcement); longer ones send only pages with forward-looking wording plus their neighbours. A file with no forward-looking wording gets no Claude call ($0). The report finder in URL mode is not changed, so guidance comes from the reports it already picks. Upload transcripts or decks to cover those.
+   - `tools/generate_excel.py` merges all extractions and writes the workbook (the non-GAAP sheets come from `tools/non_gaap_excel.py`, the segment sheet from `tools/segments_excel.py`, the guidance log from `tools/guidance_excel.py`).
 3. **CLI alternative:**
    ```
    py tools/download_reports.py <url> --years 3
    py tools/extract_financials.py .tmp/reports/<site>/documents.json
    py tools/extract_non_gaap.py .tmp/reports/<site>/documents.json
    py tools/extract_segments.py .tmp/reports/<site>/documents.json
-   py tools/generate_excel.py .tmp/reports/<site>/extractions.json --non-gaap .tmp/reports/<site>/non_gaap.json --segments .tmp/reports/<site>/segments.json
+   py tools/extract_guidance.py .tmp/reports/<site>/documents.json
+   py tools/generate_excel.py .tmp/reports/<site>/extractions.json --non-gaap .tmp/reports/<site>/non_gaap.json --segments .tmp/reports/<site>/segments.json --guidance .tmp/reports/<site>/guidance.json
    ```
-   `--non-gaap` and `--segments` are optional; without them the workbook leaves out those sheets.
+   `--non-gaap`, `--segments` and `--guidance` are optional; without them the workbook leaves out those sheets.
+4. **After code changes, restart the local app** (Ctrl+C, then `py -m streamlit run streamlit_app.py`). Streamlit re-runs `streamlit_app.py` on save but keeps the old `tools/` modules loaded, which causes errors like `build() got an unexpected keyword argument`.
 
 ## Non-GAAP extraction rules (extract_non_gaap.py / non_gaap_excel.py)
 - "GAAP" means whatever standard the company reports under (US GAAP, IFRS, HKFRS, Ind AS). The basis is recorded and shown on the sheets.
@@ -59,6 +63,13 @@ Add `ANTHROPIC_API_KEY=sk-ant-...` to `.env`.
 - If tables in one breakdown use different units, Claude converts them to one unit and says so in the unit label (e.g. a prior quarter shown only in RMB millions becomes rounded RMB'000).
 - When merging, lines are matched by metric + label + occurrence, **not by parent**. So a line that moved under a new segment (Xiaomi's Smartphones moved under "Smartphone × AIoT" in 2025) keeps one continuous series, and its nesting follows the newest report. Total lines are matched by metric alone and labelled "Total". Renamed lines (e.g. "Mainland China" → "Chinese Mainland", "Others" → "Other related businesses") stay separate rows, as published.
 - Check: each breakdown's revenue Total should equal Revenue on the Income Statement sheet for the same period.
+
+## Guidance rules (extract_guidance.py / guidance_excel.py)
+- **Captured:** every forward-looking statement about the company's own future, whether financial, operational, ESG or other, and whether numeric or qualitative.
+- **Skipped:** historical results, third-party forecasts (IMF, Omdia), forward-looking-statement disclaimers and accounting estimates. Boilerplate such as "expected credit loss" and "expected useful life" is also ignored by the "does this file have any forward-looking wording" check.
+- Values are copied as printed (no rescaling). A point value fills both Low and High, "exceed / at least" fills Low only, and "up to" fills High only.
+- Claude is asked to reuse one short metric name per target (e.g. "EV deliveries") so revisions line up. Status is only filled when the report itself says raised, lowered, reiterated or achieved.
+- **No merging:** every statement from every report is kept. "Issued in" is the report's period: from the IR page in URL mode, otherwise from the statements pass of the same file. As on the Sources sheet, a half-year report shows as "H1", because the longest period at that date wins.
 
 ## Merge rules (generate_excel.py)
 - Column = (period end date, duration in months). When two reports cover the same column, the newest report wins, so restated figures are used.
@@ -74,12 +85,14 @@ Add `ANTHROPIC_API_KEY=sk-ant-...` to `.env`.
 - **Non-GAAP sheets empty:** expected for 10-Q/10-K, full annual reports and other filings without adjusted measures. Earnings releases and results announcements are where reconciliations usually appear.
 - **A non-GAAP line split into two rows:** a measure was named differently across reports (the `measure` field). Tighten the naming rule in `extract_non_gaap.py` `SYSTEM` and bump the version.
 - **Wrong or missing segment figures:** delete the `_segments_` cache file and re-run. If a segment table was missed, check that its page passes the filter: `select_segment_pages` in `extract_segments.py` (keywords, `MIN_TABLE_NUMBERS`). Prompt changes need `SEGMENTS_PROMPT_VERSION` bumped; the other caches are untouched.
+- **Guidance missing or wrong:** delete the `_guidance_` cache file and re-run. If it recurs, tighten `SYSTEM` in `extract_guidance.py` and bump `GUIDANCE_PROMPT_VERSION`. To check a quote, search the PDF for it. Footnote markers can sit inside sentences ("…in August 2024 ¹⁹."), so an exact text search may miss it.
+- **The same target shows under two metric names:** Claude named it differently in two reports. Filter the Guidance sheet on Metric, or tighten the naming rule in the prompt.
 - **Segment Total doesn't match Income Statement revenue:** small differences are expected when a period was only available in a rounded unit (millions). Larger gaps mean a line was missed; re-extract that file.
 
 ## Notes and Constraints
-- **Cost:** classification is about $0.01–0.05 per page scan. Extraction is roughly $0.10–0.40 per results announcement after page filtering, and more for full annual reports. The non-GAAP pass adds about $0.15 per Xiaomi announcement (12–16 pages sent), and $0 when no non-GAAP wording is found. The segment pass adds about $0.13–0.34 per Xiaomi announcement (9–27 pages sent; Q4/annual results are the largest). Cached extractions are free. The app shows the actual cost after each run, including all three passes.
+- **Cost:** classification is about $0.01–0.05 per page scan. Extraction is roughly $0.10–0.40 per results announcement after page filtering, and more for full annual reports. The non-GAAP pass adds about $0.15 per Xiaomi announcement (12–16 pages sent), and $0 when no non-GAAP wording is found. The segment pass adds about $0.13–0.34 per Xiaomi announcement (9–27 pages sent; Q4/annual results are the largest). The guidance pass adds about $0.18–0.21 per Xiaomi announcement (whole text, about 100k characters). Cached extractions are free. The app shows the actual cost after each run, including all four passes.
 - **Playwright must stay in the main Streamlit thread;** only the Claude extraction calls run in parallel (4 workers).
 - **Model:** `claude-opus-5-5` with server-side refusal fallback enabled (`fallbacks="default"`).
 
 ## Site notes
-- **ir.mi.com (Xiaomi, HKEX 1810):** headless is blocked (Akamai), but a visible browser works. Each quarter has "Announcement" (full statements, about 46 pages, statements on about pages 30–34), "Presentation" (slides) and "Webcast". The Q4 announcement is the annual results. The quarterly page lists about 2018–present. Separate "Annual & Interim Reports" page exists. Clicking the nav menu's `aria-expanded` toggles navigates away, so `_expand_page` skips nav/header elements. Non-IFRS: one reconciliation ("Profit for the period" plus net margin) with 5 adjustments (share-based comp, fair-value changes on investments, amortization of acquired intangibles, changes in value of financial liabilities to investors, income tax effects), printed as one transposed table per period, about 2 pages before the financial statements. Segments: since 2025 there are 2 segments ("Smartphone × AIoT" with Smartphones / IoT and lifestyle products / Internet services / Other related businesses, and "Smart EV, AI and other new initiatives"), with gross profit and margin in the MD&A. Until 2022 there were 4 flat segments (Smartphones, IoT and lifestyle products, Internet services, Others). Geography is Chinese Mainland vs rest of the world, in the notes (quarterly in Q1–Q3 announcements, full year only in Q4).
+- **ir.mi.com (Xiaomi, HKEX 1810):** headless is blocked (Akamai), but a visible browser works. Each quarter has "Announcement" (full statements, about 46 pages, statements on about pages 30–34), "Presentation" (slides) and "Webcast". The Q4 announcement is the annual results. The quarterly page lists about 2018–present. Separate "Annual & Interim Reports" page exists. Clicking the nav menu's `aria-expanded` toggles navigates away, so `_expand_page` skips nav/header elements. Non-IFRS: one reconciliation ("Profit for the period" plus net margin) with 5 adjustments (share-based comp, fair-value changes on investments, amortization of acquired intangibles, changes in value of financial liabilities to investors, income tax effects), printed as one transposed table per period, about 2 pages before the financial statements. Segments: since 2025 there are 2 segments ("Smartphone × AIoT" with Smartphones / IoT and lifestyle products / Internet services / Other related businesses, and "Smart EV, AI and other new initiatives"), with gross profit and margin in the MD&A. Until 2022 there were 4 flat segments (Smartphones, IoT and lifestyle products, Internet services, Others). Geography is Chinese Mainland vs rest of the world, in the notes (quarterly in Q1–Q3 announcements, full year only in Q4). Guidance: there is no formal financial guidance. Expect about 4–9 narrative items per announcement, mostly EV delivery targets (FY2024: 120k in the Q2 report, then 130k in Q3; FY2026: 550k), R&D spend (>RMB200bn over 2026–2030), buybacks and product launch dates, all in the Business Review section (pages 3–8).
