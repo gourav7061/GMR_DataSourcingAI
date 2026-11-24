@@ -76,7 +76,7 @@ def _num_format(vals) -> str:
 
 
 def write_workbook(company: str, merged: dict, extractions: list[dict], out_path: Path,
-                   non_gaap_merged: dict | None = None) -> Path:
+                   non_gaap_merged: dict | None = None, segments_merged: dict | None = None) -> Path:
     wb = Workbook()
     wb.remove(wb.active)
     bold, hdr_fill = Font(bold=True), PatternFill("solid", fgColor="DDE5F0")
@@ -119,6 +119,11 @@ def write_workbook(company: str, merged: dict, extractions: list[dict], out_path
 
         write_non_gaap_sheets(wb, company, non_gaap_merged)
 
+    if segments_merged is not None:
+        from segments_excel import write_segments_sheet
+
+        write_segments_sheet(wb, company, segments_merged)
+
     ws = wb.create_sheet("Sources")
     headers = ["Period", "Document type", "Period end", "Source URL", "File"]
     for j, h in enumerate(headers, start=1):
@@ -137,17 +142,23 @@ def write_workbook(company: str, merged: dict, extractions: list[dict], out_path
 
 
 def build(company: str, extractions: list[dict], out_path: Path | None = None,
-          non_gaap: list[dict] | None = None) -> tuple[Path, dict]:
-    """non_gaap: results of extract_non_gaap.py; when given, the result dict also has merged['non_gaap']."""
+          non_gaap: list[dict] | None = None, segments: list[dict] | None = None) -> tuple[Path, dict]:
+    """non_gaap / segments: results of extract_non_gaap.py / extract_segments.py; when given, the result dict
+    also has merged['non_gaap'] / merged['segments']."""
     merged = merge(extractions)
-    ng_merged = None
+    ng_merged = seg_merged = None
     if non_gaap is not None:
         from non_gaap_excel import merge_non_gaap
 
         ng_merged = merge_non_gaap(non_gaap)
+    if segments is not None:
+        from segments_excel import merge_segments
+
+        seg_merged = merge_segments(segments)
     out_path = out_path or OUTPUT_DIR / f"{safe_filename(company)}_financials.xlsx"
-    path = write_workbook(company, merged, extractions, out_path, ng_merged)
-    return path, ({**merged, "non_gaap": ng_merged} if ng_merged is not None else merged)
+    path = write_workbook(company, merged, extractions, out_path, ng_merged, seg_merged)
+    extra = {k: v for k, v in (("non_gaap", ng_merged), ("segments", seg_merged)) if v is not None}
+    return path, {**merged, **extra}
 
 
 if __name__ == "__main__":
@@ -155,10 +166,13 @@ if __name__ == "__main__":
     ap.add_argument("extractions_json")
     ap.add_argument("--out")
     ap.add_argument("--non-gaap", help="non_gaap.json from extract_non_gaap.py")
+    ap.add_argument("--segments", help="segments.json from extract_segments.py")
     args = ap.parse_args()
     meta = json.loads(Path(args.extractions_json).read_text(encoding="utf-8"))
     ng = json.loads(Path(args.non_gaap).read_text(encoding="utf-8"))["extractions"] if args.non_gaap else None
-    path, merged = build(meta["company"], meta["extractions"], Path(args.out) if args.out else None, ng)
+    seg = json.loads(Path(args.segments).read_text(encoding="utf-8"))["extractions"] if args.segments else None
+    path, merged = build(meta["company"], meta["extractions"], Path(args.out) if args.out else None, ng, seg)
     merged.pop("non_gaap", None)
+    merged.pop("segments", None)
     print(json.dumps({"output": str(path), **{k: f"{len(v['rows'])} rows x {len(v['columns'])} periods"
                                                for k, v in merged.items()}}))
