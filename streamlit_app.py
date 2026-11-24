@@ -14,7 +14,9 @@ sys.path.insert(0, str(Path(__file__).parent / "tools"))
 from common import REPORTS_DIR, UPLOAD_DIR, get_client, safe_filename, site_slug  # noqa: E402
 from download_reports import discover, download, filter_years, open_site  # noqa: E402
 from extract_financials import extract_one  # noqa: E402
+from extract_non_gaap import extract_non_gaap_one  # noqa: E402
 from generate_excel import SHEETS, build  # noqa: E402
+from non_gaap_excel import EMPTY_MSG, NG_SHEETS, sheet_rows  # noqa: E402
 
 UPLOAD_TYPES = ["pdf", "xlsx", "xlsm", "csv", "htm", "html"]
 # the IR-URL mode needs a visible browser window, which cloud hosts (Linux, no display) can't open
@@ -49,8 +51,8 @@ if app_password and not st.session_state.get("authenticated"):
         st.error("Wrong password.")
     st.stop()
 st.title("Financial statements extractor")
-st.caption("Extracts the income statement, balance sheet and cash flow from quarterly and annual reports "
-           "into one Excel workbook, with every period as a column.")
+st.caption("Extracts the income statement, balance sheet and cash flow, plus GAAP to non-GAAP reconciliations, "
+           "from quarterly and annual reports into one Excel workbook, with every period as a column.")
 
 try:
     client = get_client()
@@ -79,20 +81,27 @@ def run_extraction(docs: list[dict], company: str | None, reuse: bool, status, l
     status.update(label=f"Extracting {len(docs)} reports with Claude...")
     progress = st.progress(0.0)
     ok, failed, cost = [], [], 0.0
+    ng_ok, ng_failed = [], []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(extract_one, d, client, not reuse, log): d for d in docs}
+        futures = {pool.submit(extract_one, d, client, not reuse, log): ("statements", d) for d in docs}
+        futures.update({pool.submit(extract_non_gaap_one, d, client, not reuse, log): ("non_gaap", d)
+                        for d in docs})
         for i, fut in enumerate(as_completed(futures), start=1):
-            d = futures[fut]
+            kind, d = futures[fut]
             name = d.get("file_name") or d["period_label"]
             try:
                 r = fut.result()
-                ok.append(r)
+                (ok if kind == "statements" else ng_ok).append(r)
                 cost += r["cost_usd"]
             except Exception as e:
-                failed.append((name, str(e)))
-                log(f"FAILED {name}: {e}")
+                if kind == "statements":
+                    failed.append((name, str(e)))
+                    log(f"FAILED {name}: {e}")
+                else:
+                    ng_failed.append((name, str(e)))
+                    log(f"FAILED non-GAAP {name}: {e}")
             log.flush()
-            progress.progress(i / len(docs))
+            progress.progress(i / len(futures))
     if not ok:
         raise RuntimeError("No report could be extracted.")
     if not company:
@@ -101,8 +110,9 @@ def run_extraction(docs: list[dict], company: str | None, reuse: bool, status, l
         if len(names) > 1:
             log(f"Note: the files name more than one company ({', '.join(names)}); using '{company}'.")
             log.flush()
-    path, merged = build(company, ok)
-    st.session_state.results = {"path": str(path), "merged": merged, "failed": failed, "cost": cost, "n": len(ok)}
+    path, merged = build(company, ok, non_gaap=ng_ok)
+    st.session_state.results = {"path": str(path), "merged": merged, "failed": failed, "ng_failed": ng_failed,
+                                "cost": cost, "n": len(ok)}
     status.update(label=f"Done: {len(ok)} reports extracted, Claude cost ${cost:.2f}", state="complete")
 
 
@@ -127,7 +137,22 @@ def show_results():
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     for label, err in res["failed"]:
         st.warning(f"{label} was not extracted: {err}")
-    for stype, tab in zip(SHEETS, st.tabs(list(SHEETS.values()))):
+    for label, err in res.get("ng_failed", []):
+        st.warning(f"Non-GAAP measures from {label} were not extracted: {err}")
+    tabs = st.tabs(list(SHEETS.values()) + list(NG_SHEETS.values()))
+    ng = res["merged"].get("non_gaap")
+    for kind, tab in zip(NG_SHEETS, tabs[len(SHEETS):]):
+        rows = sheet_rows(ng, kind) if ng else []
+        if not rows:
+            tab.info(EMPTY_MSG)
+            continue
+        tab.caption(f"Unit: {ng['unit_label']} · Basis: {ng['gaap_basis'] or 'GAAP'}")
+        df = pd.DataFrame(
+            [["    " * r["level"] + r["label"]] + (r["values"] or [None] * len(ng["columns"])) for r in rows],
+            columns=["Line item"] + [f"{c['label']} ({c['period_end']})" for c in ng["columns"]],
+        )
+        tab.dataframe(df, hide_index=True, use_container_width=True, height=600)
+    for stype, tab in zip(SHEETS, tabs):
         data = res["merged"][stype]
         if not data["rows"]:
             tab.info("This statement was not found in the reports.")
@@ -161,7 +186,8 @@ with upload_tab:
         st.dataframe(pd.DataFrame([{"File": d["file_name"], "Size": f"{Path(d['file']).stat().st_size / 1024:,.0f} KB"}
                                    for d in docs]), hide_index=True, use_container_width=True)
         st.caption(f"{len(docs)} file{'s' if len(docs) != 1 else ''}. Rough cost: about \\$0.10-\\$0.40 per results "
-                   f"announcement, more for full annual reports. Files extracted before are free. "
+                   f"announcement, more for full annual reports, plus about \\$0.05-\\$0.25 for non-GAAP "
+                   f"reconciliations where present. Files extracted before are free. "
                    f"The period of each file is detected automatically.")
     if st.button("Extract", type="primary", disabled=not docs, key="extract_up"):
         with st.status("Starting...", expanded=True) as status:
@@ -204,7 +230,8 @@ def url_mode():
                                 column_config={"URL": st.column_config.LinkColumn()})
         selected = [d for d, keep in zip(url_docs, edited["Extract"]) if keep]
         st.caption(f"{len(selected)} selected. Rough cost: about \\$0.10-\\$0.40 per results announcement, "
-                   f"more for full annual reports. Cached extractions are free.")
+                   f"more for full annual reports, plus about \\$0.05-\\$0.25 for non-GAAP reconciliations "
+                   f"where present. Cached extractions are free.")
 
         if st.button("2. Download and extract", type="primary", disabled=not selected):
             with st.status("Downloading reports...", expanded=True) as status:
