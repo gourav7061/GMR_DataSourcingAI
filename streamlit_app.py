@@ -10,7 +10,28 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-sys.path.insert(0, str(Path(__file__).parent / "tools"))
+TOOLS_DIR = Path(__file__).parent / "tools"
+sys.path.insert(0, str(TOOLS_DIR))
+
+
+def _tool_modules() -> dict:
+    """Loaded modules that come from tools/, by file."""
+    out = {}
+    for f in TOOLS_DIR.glob("*.py"):
+        mod = sys.modules.get(f.stem)
+        if mod is not None and getattr(mod, "__file__", None) and Path(mod.__file__).resolve() == f.resolve():
+            out[f] = mod
+    return out
+
+
+# Streamlit re-runs this script after a code change but keeps the tools/ modules it imported before, so a running
+# server would mix new and old code. When any tools file changed since it was loaded, drop them all (they import
+# each other) so the imports below load the current code. Running extractions keep their own module objects.
+_loaded = _tool_modules()
+if any(getattr(m, "_source_mtime", None) != f.stat().st_mtime for f, m in _loaded.items()):
+    for f in _loaded:
+        sys.modules.pop(f.stem, None)
+
 from common import REPORTS_DIR, UPLOAD_DIR, get_client, safe_filename, site_slug  # noqa: E402
 from download_reports import discover, download, filter_years, open_site  # noqa: E402
 from extract_financials import extract_one  # noqa: E402
@@ -21,7 +42,10 @@ from extract_segments import extract_segments_one  # noqa: E402
 from segments_excel import EMPTY_MSG as SEG_EMPTY_MSG, SEGMENTS_SHEET, sheet_rows as segment_rows  # noqa: E402
 from extract_guidance import extract_guidance_one  # noqa: E402
 from guidance_excel import COLUMNS as GD_COLUMNS, EMPTY_MSG as GD_EMPTY_MSG, GUIDANCE_SHEET  # noqa: E402
-from checks import CHECKS_SHEET, COLUMNS as CK_COLUMNS  # noqa: E402
+from checks import CHECKS_SHEET, COLUMNS as CK_COLUMNS, check_rows  # noqa: E402
+
+for _f, _m in _tool_modules().items():
+    _m._source_mtime = _f.stat().st_mtime
 
 UPLOAD_TYPES = ["pdf", "xlsx", "xlsm", "csv", "htm", "html"]
 # the IR-URL mode needs a visible browser window, which cloud hosts (Linux, no display) can't open
@@ -135,8 +159,13 @@ def run_extraction(docs: list[dict], company: str | None, reuse: bool, status, l
             log(f"Note: the files name more than one company ({', '.join(names)}); using '{company}'.")
             log.flush()
     path, merged = build(company, ok, non_gaap=ng_ok, segments=seg_ok, guidance=gd_ok)
+    # checks come straight from the extractions (cached ones included), not from the workbook builder
+    checks = merged.get("checks")
+    if checks is None:
+        checks = check_rows(ok)
     st.session_state.results = {"path": str(path), "merged": merged, "failed": failed, "ng_failed": ng_failed,
-                                "seg_failed": seg_failed, "gd_failed": gd_failed, "cost": cost, "n": len(ok)}
+                                "seg_failed": seg_failed, "gd_failed": gd_failed, "cost": cost, "n": len(ok),
+                                "checks": checks}
     status.update(label=f"Done: {len(ok)} reports extracted, Claude cost ${cost:.2f}", state="complete")
 
 
@@ -167,9 +196,11 @@ def show_results():
         st.warning(f"Revenue segments from {label} were not extracted: {err}")
     for label, err in res.get("gd_failed", []):
         st.warning(f"Guidance from {label} was not extracted: {err}")
-    ck_rows = res["merged"].get("checks") or []
+    ck_rows = res.get("checks")
+    if ck_rows is None:
+        ck_rows = res["merged"].get("checks")
     flagged = {}
-    for r in ck_rows:
+    for r in ck_rows or []:
         if r["Result"] in ("FAIL", "MISSING"):
             flagged.setdefault(r["File"] or "All files", []).append(f"{r['Statement']}: {r['Check']}"
                                                                      + (f" ({r['Column']})" if r["Column"] else ""))
@@ -177,7 +208,10 @@ def show_results():
         st.warning(f"Please verify {file}: " + "; ".join(dict.fromkeys(items)) + ". See the Checks tab.")
     tabs = st.tabs(list(SHEETS.values()) + list(NG_SHEETS.values()) + [SEGMENTS_SHEET, GUIDANCE_SHEET, CHECKS_SHEET])
     ck_tab = tabs[-1]
-    if not ck_rows:
+    if ck_rows is None:
+        ck_tab.info("These results were produced before checks existed. Click Extract again to see them "
+                    "(free when 'Reuse previous extractions' is ticked).")
+    elif not ck_rows:
         ck_tab.info("No statements were extracted, so there is nothing to check.")
     else:
         ck_tab.caption("Automatic checks: each statement is present and its totals add up. "

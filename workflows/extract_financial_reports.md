@@ -50,7 +50,7 @@ Add `ANTHROPIC_API_KEY=sk-ant-...` to `.env`.
    py tools/generate_excel.py .tmp/reports/<site>/extractions.json --non-gaap .tmp/reports/<site>/non_gaap.json --segments .tmp/reports/<site>/segments.json --guidance .tmp/reports/<site>/guidance.json
    ```
    `--non-gaap`, `--segments` and `--guidance` are optional; without them the workbook leaves out those sheets.
-4. **After code changes, restart the local app** (Ctrl+C, then `py -m streamlit run streamlit_app.py`). Streamlit re-runs `streamlit_app.py` on save but keeps the old `tools/` modules loaded, which causes errors like `build() got an unexpected keyword argument`.
+4. **Code changes take effect without a restart.** Streamlit re-runs `streamlit_app.py` on save but keeps already-imported `tools/` modules. That mix of new and old code caused `build() got an unexpected keyword argument` and a Checks tab saying "No statements were extracted". The app now stamps each tools module with its file time and reloads all of them when any tools file changed. Results shown from an earlier run keep their old shape; click **Extract** again (free with reuse) to refresh them. A restart or reboot is still the clean option after `requirements.txt` changes.
 
 ## Page finding (page_finder.py), for any company
 Every company lays its reports out differently, so pages are found by **content**, not by a fixed layout.
