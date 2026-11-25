@@ -5,28 +5,22 @@ Usage:
 
 documents.json is produced by download_reports.py. Each extraction is cached in
 .tmp/extractions/ keyed by file hash, so re-runs cost nothing unless --force.
+
+Pages are chosen by page_finder.py (rules, plus Claude Haiku when needed). After extraction, checks.py
+verifies the statements; if one is missing or its totals don't add up, the extraction is retried once
+with the AI page finder's pages added, and the better result is kept.
 """
 import argparse
-import base64
-import hashlib
-import io
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from common import EXTRACT_DIR, call_json, get_client
+from common import EXTRACT_DIR, call_json, file_hash, get_client
 
 PROMPT_VERSION = 1
 EFFORT = "medium"
-MAX_FULL_PDF_PAGES = 120
-
-TITLE_RE = re.compile(
-    r"(statements? of (consolidated )?(profit or loss|comprehensive income|income|operations|earnings|"
-    r"financial position|cash flows?)|balance sheets?|income statements?|cash flows? statements?|"
-    r"profit and loss)",
-    re.I,
-)
+UNIT_MULTIPLIERS = [1, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
 
 ROW = {
     "type": "object",
@@ -63,7 +57,7 @@ SCHEMA = {
                     "statement": {"type": "string", "enum": ["income_statement", "balance_sheet", "cash_flow"]},
                     "title": {"type": "string"},
                     "unit_label": {"type": "string"},
-                    "unit_multiplier": {"type": "integer", "enum": [1, 1000, 1000000, 1000000000]},
+                    "unit_multiplier": {"type": "integer", "enum": UNIT_MULTIPLIERS},
                     "columns": {"type": "array", "items": COLUMN},
                     "rows": {"type": "array", "items": ROW},
                 },
@@ -90,54 +84,8 @@ Columns: include every period column the statement shows (e.g. three months and 
 
 Rows: every line item in published order, including headings and subtotals, with the label text as printed (English). level is the indentation depth (0 = section heading or top level, 1 = item under it, and so on). is_total marks subtotals and totals. Headings without numbers get null values. values has one entry per column, in column order.
 
-Numbers: transcribe as plain numbers in the statement's own unit, without rescaling. Parentheses or a leading minus mean negative. A dash or blank means null. unit_label is the unit as stated (e.g. "RMB million"); unit_multiplier is its scale (1, 1000, 1000000 or 1000000000). Set unscaled=true on rows whose values are not in that unit: per-share amounts, share counts, percentages.
+Numbers: transcribe as plain numbers in the statement's own unit, without rescaling. Parentheses or a leading minus mean negative. A dash or blank means null. unit_label is the unit as stated (e.g. "RMB million"); unit_multiplier is its scale (1, 1000, 1000000 or 1000000000; also 100000 for lakh, 10000000 for crore, 10000 for 万, 100000000 for 億/亿). Set unscaled=true on rows whose values are not in that unit: per-share amounts, share counts, percentages.
 Accuracy matters more than anything else: copy each figure exactly."""
-
-
-def file_hash(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:20]
-
-
-def select_pdf_pages(path: Path) -> tuple[bytes, int, int]:
-    """Return a smaller PDF holding only statement pages (plus the page after each). Returns (pdf_bytes, kept, total)."""
-    from pypdf import PdfReader, PdfWriter
-
-    reader = PdfReader(str(path))
-    total = len(reader.pages)
-    keep = set()
-    for i, page in enumerate(reader.pages):
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-        head = "\n".join(text.strip().splitlines()[:6])
-        if TITLE_RE.search(head):
-            keep.update({i, i + 1})
-    keep = sorted(k for k in keep if k < total)
-    if not keep:
-        if total > MAX_FULL_PDF_PAGES:
-            raise RuntimeError(
-                f"Could not locate statement pages in a {total}-page PDF (it may be scanned). "
-                f"Sending it whole would be expensive, so it was skipped."
-            )
-        return path.read_bytes(), total, total
-    writer = PdfWriter()
-    for k in keep:
-        writer.add_page(reader.pages[k])
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue(), len(keep), total
-
-
-def _html_text(path: Path) -> str:
-    from bs4 import BeautifulSoup
-
-    text = BeautifulSoup(path.read_bytes(), "html.parser").get_text("\n")
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    if len(text) <= 400_000:
-        return text
-    parts = [text[m.start(): m.start() + 30_000] for m in TITLE_RE.finditer(text)]
-    return "\n...\n".join(parts) or text[:400_000]
 
 
 def _sheet_text(path: Path) -> str:
@@ -155,20 +103,21 @@ def _sheet_text(path: Path) -> str:
     return "\n".join(out)
 
 
-def build_content(path: Path, log=print) -> list:
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        pdf, kept, total = select_pdf_pages(path)
-        log(f"  {path.name}: sending {kept} of {total} pages")
-        block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                 "data": base64.standard_b64encode(pdf).decode()}}
-    elif suffix in (".htm", ".html"):
-        block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": _html_text(path)}}
-    elif suffix in (".xlsx", ".xlsm", ".csv"):
-        block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": _sheet_text(path)}}
-    else:
-        raise RuntimeError(f"Unsupported file type: {suffix}")
-    return [block, {"type": "text", "text": "Extract the income statement, balance sheet and cash flow statement."}]
+def build_content(path: Path, log=print, client=None, need_ai: bool = False, extra_pages=()) -> tuple[list, dict]:
+    """(content blocks, page info). Page info has 'pages' (0-based, sent), 'total', 'profile', 'ai', 'cost_usd'."""
+    from page_finder import content_block, language_note
+
+    if path.suffix.lower() not in (".pdf", ".htm", ".html", ".xlsx", ".xlsm", ".csv"):
+        raise RuntimeError(f"Unsupported file type: {path.suffix.lower()}")
+    block, info = content_block(path, "statements", client, need_ai, log, extra_pages, whole_if_none=True)
+    if path.suffix.lower() == ".pdf":
+        log(f"  {path.name}: sending {len(info['pages'])} of {info['total']} pages"
+            + (" (AI page finder used)" if info["ai"] else ""))
+    text = ("Extract the income statement, balance sheet and cash flow statement. If the document holds several "
+            "sets of statements (consolidated and standalone / parent company, or the same statements under another "
+            "accounting standard or currency), use the consolidated set in the currency of the company's main "
+            "financial statements, and take all three statements from that same set." + language_note(info["profile"]))
+    return [block, {"type": "text", "text": text}], info
 
 
 def latest_period(data: dict) -> tuple[str, str]:
@@ -196,23 +145,67 @@ def extract_one(doc: dict, client=None, force: bool = False, log=print) -> dict:
     EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
     cache = EXTRACT_DIR / f"{file_hash(path)}_v{PROMPT_VERSION}.json"
     if cache.exists() and not force:
-        log(f"Cached extraction: {name}")
         data = json.loads(cache.read_text(encoding="utf-8"))
-        return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        if data.get("statements"):
+            log(f"Cached extraction: {name}")
+            if "checks" not in data:  # cached before checks existed: compute them (free)
+                from checks import check_statements
+
+                data["checks"] = check_statements(data)
+            return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        # an earlier run found no statements at all (e.g. wrong pages were sent): try again rather than reuse it
+        log(f"Previous extraction of {name} found no statements; extracting again")
     if path.suffix.lower() == ".xls":
         raise RuntimeError("Old .xls files aren't supported. Open it in Excel and save as .xlsx.")
+    from checks import better, check_statements, needs_retry, summary
+
     client = client or get_client()
     log(f"Extracting {name}...")
-    data, cost = call_json(client, build_content(path, log), SCHEMA, effort=EFFORT, system=SYSTEM)
-    for st in data["statements"]:
-        n = len(st["columns"])
-        for row in st["rows"]:
-            row["values"] = (row["values"] + [None] * n)[:n]
+    content, info = build_content(path, log, client)
+    data, cost = _extract(client, content)
+    cost += info["cost_usd"]
+    data["checks"] = check_statements(data)
+    data["pages_sent"] = [p + 1 for p in info["pages"]]
+    retried = False
+
+    # retry once when a statement is missing or does not add up, with the AI page finder's pages added
+    if needs_retry(data["checks"]) and path.suffix.lower() in (".pdf", ".htm", ".html"):
+        s = summary(data["checks"])
+        log(f"  {name}: {s['missing']} statement(s) missing, {s['fail']} check(s) failed; retrying with the AI page finder")
+        # statements sit together: when one is missing, also send the pages around the ones already found
+        near = set()
+        if s["missing"] and path.suffix.lower() == ".pdf" and len(info["pages"]) < info["total"]:
+            near = {p + k for p in info["pages"] for k in (-3, -2, -1, 1, 2, 3)} - set(info["pages"])
+        content2, info2 = build_content(path, log, client, need_ai=True, extra_pages=set(info["pages"]) | near)
+        cost += info2["cost_usd"]
+        if set(info2["pages"]) != set(info["pages"]) or not info["ai"]:
+            data2, cost2 = _extract(client, content2)
+            cost += cost2
+            retried = True
+            data2["checks"] = check_statements(data2)
+            data2["pages_sent"] = [p + 1 for p in info2["pages"]]
+            if better(data["checks"], data2["checks"]):
+                data = data2
+                log(f"  {name}: retry kept (better checks)")
+            else:
+                log(f"  {name}: retry was not better; kept the first result")
+        else:
+            log(f"  {name}: the AI page finder found no other pages; kept the first result")
+    data["retried"] = retried
     cache.write_text(json.dumps(data, indent=1), encoding="utf-8")
     data = _with_source(data, doc)
     found = ", ".join(s["statement"] for s in data["statements"]) or "none"
     log(f"Done {name} -> {data['source']['period_label']}: {found} (${cost:.2f})")
     return {**data, "cost_usd": cost, "cached": False}
+
+
+def _extract(client, content) -> tuple[dict, float]:
+    data, cost = call_json(client, content, SCHEMA, effort=EFFORT, system=SYSTEM)
+    for st in data["statements"]:
+        n = len(st["columns"])
+        for row in st["rows"]:
+            row["values"] = (row["values"] + [None] * n)[:n]
+    return data, cost
 
 
 def extract_many(docs: list[dict], force: bool = False, workers: int = 4, log=print) -> tuple[list[dict], list[dict]]:

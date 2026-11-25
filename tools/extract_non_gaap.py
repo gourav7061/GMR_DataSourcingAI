@@ -10,25 +10,15 @@ Writes non_gaap.json next to documents.json. Files without any non-GAAP wording 
 without a Claude call (cost $0) and cached as empty.
 """
 import argparse
-import base64
-import io
 import json
-import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from common import EXTRACT_DIR, call_json, get_client
-from extract_financials import _sheet_text, file_hash, latest_period
+from common import EXTRACT_DIR, call_json, file_hash, get_client
+from extract_financials import UNIT_MULTIPLIERS, latest_period
 
 NON_GAAP_PROMPT_VERSION = 1
 EFFORT = "medium"
-MAX_PAGES = 30
-
-KEYWORD_RE = re.compile(
-    r"non[- ]?(gaap|ifrs|hkfrs|ind[- ]?as)|adjusted (net|ebitda|ebit|operating|earnings|profit|diluted|basic|eps)|"
-    r"reconciliation of (gaap|ifrs|non)|underlying (profit|earnings)",
-    re.I,
-)
 
 COLUMN = {
     "type": "object",
@@ -66,7 +56,7 @@ SCHEMA = {
                     "measure": {"type": "string"},
                     "title": {"type": "string"},
                     "unit_label": {"type": "string"},
-                    "unit_multiplier": {"type": "integer", "enum": [1, 1000, 1000000, 1000000000]},
+                    "unit_multiplier": {"type": "integer", "enum": UNIT_MULTIPLIERS},
                     "columns": {"type": "array", "items": COLUMN},
                     "rows": {"type": "array", "items": ROW},
                 },
@@ -93,86 +83,23 @@ If an EBITDA or adjusted EBITDA reconciliation starts from net profit, it is sti
 
 Columns: label in the company's fiscal convention ("Q2 2025" for a 3-month quarter, "H1 2025", "9M 2025", "FY2025"), period_end as YYYY-MM-DD, duration_months (3, 6, 9 or 12).
 
-Numbers: plain numbers in the table's own unit, no rescaling. Parentheses or a leading minus mean negative; keep each adjustment's sign as printed. A dash or blank means null. unit_label is the unit as stated (e.g. "RMB in thousand"); unit_multiplier its scale. Set unscaled=true on per-share amounts, share counts and percentages.
+Numbers: plain numbers in the table's own unit, no rescaling. Parentheses or a leading minus mean negative; keep each adjustment's sign as printed. A dash or blank means null. unit_label is the unit as stated (e.g. "RMB in thousand"); unit_multiplier its scale (100000 for lakh, 10000000 for crore, 10000 for 万, 100000000 for 億/亿). Set unscaled=true on per-share amounts, share counts and percentages.
 
 Use only reconciliation tables (and non-GAAP highlight tables that show both bases side by side if no reconciliation exists). Ignore the primary financial statements and narrative text. If the document has no non-GAAP measures, return an empty reconciliations list.
 Accuracy matters more than anything else: copy each figure exactly."""
 
 
-def select_non_gaap_pages(path: Path) -> tuple[bytes | None, int, int]:
-    """PDF holding only pages that mention non-GAAP measures (plus the page after each). None if there are none."""
-    from pypdf import PdfReader, PdfWriter
+def build_content(path: Path, log=print, client=None) -> tuple[list | None, dict]:
+    """(Claude content blocks or None when the file has no non-GAAP / APM tables, page info)."""
+    from page_finder import content_block, language_note
 
-    reader = PdfReader(str(path))
-    total = len(reader.pages)
-    hits = []
-    for i, page in enumerate(reader.pages):
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-        if KEYWORD_RE.search(text):
-            hits.append(i)
-    if not hits:
-        return None, 0, total
-    # prefer pages that actually look like reconciliation tables when there are many mentions
-    keep = sorted({k for i in hits for k in (i, i + 1) if k < total})
-    if len(keep) > MAX_PAGES:
-        recon = [i for i in hits if re.search(r"reconcil", reader.pages[i].extract_text() or "", re.I)]
-        keep = sorted({k for i in (recon or hits) for k in (i, i + 1) if k < total})[:MAX_PAGES]
-    writer = PdfWriter()
-    for k in keep:
-        writer.add_page(reader.pages[k])
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue(), len(keep), total
-
-
-def _html_text(path: Path) -> str | None:
-    from bs4 import BeautifulSoup
-
-    text = BeautifulSoup(path.read_bytes(), "html.parser").get_text("\n")
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    matches = list(KEYWORD_RE.finditer(text))
-    if not matches:
-        return None
-    if len(text) <= 400_000:
-        return text
-    spans, parts = [], []
-    for m in matches:
-        s, e = max(0, m.start() - 3_000), m.start() + 15_000
-        if spans and s <= spans[-1][1]:
-            spans[-1][1] = e
-        else:
-            spans.append([s, e])
-    for s, e in spans:
-        parts.append(text[s:e])
-    return "\n...\n".join(parts)[:400_000]
-
-
-def build_content(path: Path, log=print) -> list | None:
-    """Claude content blocks, or None when the file has no non-GAAP wording (no call needed)."""
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        pdf, kept, total = select_non_gaap_pages(path)
-        if pdf is None:
-            return None
-        log(f"  {path.name}: non-GAAP pass sending {kept} of {total} pages")
-        block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                 "data": base64.standard_b64encode(pdf).decode()}}
-    elif suffix in (".htm", ".html"):
-        text = _html_text(path)
-        if text is None:
-            return None
-        block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": text}}
-    elif suffix in (".xlsx", ".xlsm", ".csv"):
-        text = _sheet_text(path)
-        if not KEYWORD_RE.search(text):
-            return None
-        block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": text}}
-    else:
-        raise RuntimeError(f"Unsupported file type: {suffix}")
-    return [block, {"type": "text", "text": "Extract every GAAP to non-GAAP reconciliation."}]
+    block, info = content_block(path, "non_gaap", client, log=log)
+    if block is None:
+        return None, info
+    if path.suffix.lower() == ".pdf":
+        log(f"  {path.name}: non-GAAP pass sending {len(info['pages'])} of {info['total']} pages")
+    text = "Extract every GAAP to non-GAAP reconciliation." + language_note(info["profile"])
+    return [block, {"type": "text", "text": text}], info
 
 
 def _empty() -> dict:
@@ -196,10 +123,16 @@ def extract_non_gaap_one(doc: dict, client=None, force: bool = False, log=print)
     cache = EXTRACT_DIR / f"{file_hash(path)}_nongaap_v{NON_GAAP_PROMPT_VERSION}.json"
     if cache.exists() and not force:
         data = json.loads(cache.read_text(encoding="utf-8"))
-        return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        from page_finder import PAGE_RULES_VERSION, has_candidates
+
+        # an empty result from an older, narrower page filter: look again when pages are now found
+        if (data["reconciliations"] or data.get("page_rules", 0) >= PAGE_RULES_VERSION
+                or not has_candidates(path, "non_gaap")):
+            return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        log(f"  {name}: earlier run found no non-GAAP measures; the page finder now finds candidate pages")
     if path.suffix.lower() == ".xls":
         raise RuntimeError("Old .xls files aren't supported. Open it in Excel and save as .xlsx.")
-    content = build_content(path, log)
+    content, info = build_content(path, log, client)
     if content is None:
         data, cost = _empty(), 0.0
         log(f"No non-GAAP measures mentioned in {name}")
@@ -207,11 +140,15 @@ def extract_non_gaap_one(doc: dict, client=None, force: bool = False, log=print)
         client = client or get_client()
         log(f"Extracting non-GAAP measures from {name}...")
         data, cost = call_json(client, content, SCHEMA, effort=EFFORT, system=SYSTEM)
+        cost += info["cost_usd"]
         for rec in data["reconciliations"]:
             n = len(rec["columns"])
             for row in rec["rows"]:
                 row["values"] = (row["values"] + [None] * n)[:n]
         log(f"Done non-GAAP {name}: {len(data['reconciliations'])} reconciliations (${cost:.2f})")
+    from page_finder import PAGE_RULES_VERSION
+
+    data["page_rules"] = PAGE_RULES_VERSION  # an empty result made with these rules is final
     cache.write_text(json.dumps(data, indent=1), encoding="utf-8")
     return {**_with_source(data, doc), "cost_usd": cost, "cached": False}
 

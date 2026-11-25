@@ -109,9 +109,14 @@ def pdf_pages(path: Path) -> list[str]:
     return out
 
 
-def select_guidance_text(pages: list[str]) -> tuple[str | None, int]:
+def keyword_hits(pages: list[str]) -> list[int]:
+    """Pages with forward-looking wording (English), boilerplate excluded."""
+    return [i for i, t in enumerate(pages) if KEYWORD_RE.search(BOILERPLATE_RE.sub(" ", _clean(t)))]
+
+
+def select_guidance_text(pages: list[str], hits: list[int] | None = None) -> tuple[str | None, int]:
     """Text with [Page N] markers: all pages if short enough, else forward-looking pages +-1. None if no match."""
-    hits = [i for i, t in enumerate(pages) if KEYWORD_RE.search(BOILERPLATE_RE.sub(" ", _clean(t)))]
+    hits = keyword_hits(pages) if hits is None else hits
     if not hits:
         return None, 0
     if sum(len(t) for t in pages) <= MAX_CHARS:
@@ -129,31 +134,43 @@ def select_guidance_text(pages: list[str]) -> tuple[str | None, int]:
     return "\n".join(parts), kept
 
 
-def _html_pages(path: Path) -> list[str]:
-    from bs4 import BeautifulSoup
+def build_content(path: Path, log=print, client=None) -> tuple[list | None, float]:
+    """(Claude content blocks or None when the file has no forward-looking content, page-finder cost).
 
-    text = BeautifulSoup(path.read_bytes(), "html.parser").get_text("\n")
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    return [text[i:i + 5_000] for i in range(0, len(text), 5_000)]  # pseudo-pages for markers and filtering
+    Text files: the text with [Page N] markers (English: keyword pages decide; other languages: the AI page
+    finder's outlook pages decide when the text is too long to send whole). Scanned PDFs: the page images of
+    the pages the AI page finder marks as outlook / guidance."""
+    import page_finder as pf
 
-
-def build_content(path: Path, log=print) -> list | None:
-    """Claude content blocks, or None when the file has no forward-looking wording (no call needed)."""
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        pages = pdf_pages(path)
-    elif suffix in (".htm", ".html"):
-        pages = _html_pages(path)
-    elif suffix in (".xlsx", ".xlsm", ".csv"):
-        pages = [_sheet_text(path)]
-    else:
-        raise RuntimeError(f"Unsupported file type: {suffix}")
-    text, kept = select_guidance_text(pages)
+    if path.suffix.lower() not in (".pdf", ".htm", ".html", ".xlsx", ".xlsm", ".csv"):
+        raise RuntimeError(f"Unsupported file type: {path.suffix.lower()}")
+    pages = pf.page_texts(path)
+    use_ai, profile = pf.needs_ai(path)
+    note = pf.language_note(profile)
+    instruction = "Extract all forward-looking guidance."
+    if path.suffix.lower() == ".pdf" and profile["scanned"]:
+        found = pf.find_pages(path, "guidance", client, log=log)
+        if not found["pages"]:
+            return None, found["cost_usd"]
+        log(f"  {path.name}: guidance pass sending {len(found['pages'])} scanned pages")
+        block = pf._pdf_block(pf.pdf_subset(path, found["pages"]))
+        instruction += (" The report is scanned: give page as the number printed on the page, or its position "
+                        "in this PDF if none is printed.")
+        return [block, {"type": "text", "text": instruction + note}], found["cost_usd"]
+    cost = 0.0
+    hits = keyword_hits(pages)
+    if profile["language"] != "English":
+        if sum(len(t) for t in pages) <= MAX_CHARS:
+            hits = list(range(len(pages)))  # short enough to send whole; English keywords don't apply
+        else:
+            found = pf.find_pages(path, "guidance", client, log=log)
+            hits, cost = found["pages"], found["cost_usd"]
+    text, kept = select_guidance_text(pages, hits)
     if text is None:
-        return None
+        return None, cost
     log(f"  {path.name}: guidance pass sending text of {kept} of {len(pages)} pages")
     block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": text}}
-    return [block, {"type": "text", "text": "Extract all forward-looking guidance."}]
+    return [block, {"type": "text", "text": instruction + note}], cost
 
 
 def _issuing_period(doc: dict, path: Path) -> tuple[str, str]:
@@ -185,18 +202,28 @@ def extract_guidance_one(doc: dict, client=None, force: bool = False, log=print)
     cache = EXTRACT_DIR / f"{file_hash(path)}_guidance_v{GUIDANCE_PROMPT_VERSION}.json"
     if cache.exists() and not force:
         data = json.loads(cache.read_text(encoding="utf-8"))
-        return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        import page_finder as pf
+
+        # an empty result from before text normalisation / scanned / non-English support: look again if warranted
+        if (data["items"] or data.get("page_rules", 0) >= pf.PAGE_RULES_VERSION
+                or not (keyword_hits(pf.page_texts(path)) or pf.needs_ai(path)[1]["reason"])):
+            return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        log(f"  {name}: earlier run found no guidance; looking again")
     if path.suffix.lower() == ".xls":
         raise RuntimeError("Old .xls files aren't supported. Open it in Excel and save as .xlsx.")
-    content = build_content(path, log)
+    client = client or get_client()
+    content, finder_cost = build_content(path, log, client)
     if content is None:
-        data, cost = {"company": "", "items": []}, 0.0
+        data, cost = {"company": "", "items": []}, finder_cost
         log(f"No forward-looking statements in {name}")
     else:
-        client = client or get_client()
         log(f"Extracting guidance from {name}...")
         data, cost = call_json(client, content, SCHEMA, effort=EFFORT, system=SYSTEM)
+        cost += finder_cost
         log(f"Done guidance {name}: {len(data['items'])} items (${cost:.2f})")
+    from page_finder import PAGE_RULES_VERSION
+
+    data["page_rules"] = PAGE_RULES_VERSION  # an empty result made with these rules is final
     cache.write_text(json.dumps(data, indent=1), encoding="utf-8")
     return {**_with_source(data, doc), "cost_usd": cost, "cached": False}
 

@@ -77,7 +77,7 @@ def _num_format(vals) -> str:
 
 def write_workbook(company: str, merged: dict, extractions: list[dict], out_path: Path,
                    non_gaap_merged: dict | None = None, segments_merged: dict | None = None,
-                   guidance_rows: list[dict] | None = None) -> Path:
+                   guidance_rows: list[dict] | None = None, checks_rows: list[dict] | None = None) -> Path:
     wb = Workbook()
     wb.remove(wb.active)
     bold, hdr_fill = Font(bold=True), PatternFill("solid", fgColor="DDE5F0")
@@ -130,6 +130,11 @@ def write_workbook(company: str, merged: dict, extractions: list[dict], out_path
 
         write_guidance_sheet(wb, company, guidance_rows)
 
+    if checks_rows is not None:
+        from checks import write_checks_sheet
+
+        write_checks_sheet(wb, company, checks_rows)
+
     ws = wb.create_sheet("Sources")
     headers = ["Period", "Document type", "Period end", "Source URL", "File"]
     for j, h in enumerate(headers, start=1):
@@ -149,11 +154,16 @@ def write_workbook(company: str, merged: dict, extractions: list[dict], out_path
 
 def build(company: str, extractions: list[dict], out_path: Path | None = None,
           non_gaap: list[dict] | None = None, segments: list[dict] | None = None,
-          guidance: list[dict] | None = None) -> tuple[Path, dict]:
+          guidance: list[dict] | None = None, checks: bool = True) -> tuple[Path, dict]:
     """non_gaap / segments / guidance: results of extract_non_gaap.py / extract_segments.py / extract_guidance.py;
-    when given, the result dict also has merged['non_gaap'] / merged['segments'] / merged['guidance'] (rows)."""
+    when given, the result dict also has merged['non_gaap'] / merged['segments'] / merged['guidance'] (rows).
+    checks: add the Checks sheet (checks.py) and merged['checks'] (rows)."""
     merged = merge(extractions)
-    ng_merged = seg_merged = gd_rows = None
+    ng_merged = seg_merged = gd_rows = ck_rows = None
+    if checks:
+        from checks import check_rows
+
+        ck_rows = check_rows(extractions)
     if guidance is not None:
         from guidance_excel import guidance_rows
 
@@ -167,9 +177,9 @@ def build(company: str, extractions: list[dict], out_path: Path | None = None,
 
         seg_merged = merge_segments(segments)
     out_path = out_path or OUTPUT_DIR / f"{safe_filename(company)}_financials.xlsx"
-    path = write_workbook(company, merged, extractions, out_path, ng_merged, seg_merged, gd_rows)
-    extra = {k: v for k, v in (("non_gaap", ng_merged), ("segments", seg_merged), ("guidance", gd_rows))
-             if v is not None}
+    path = write_workbook(company, merged, extractions, out_path, ng_merged, seg_merged, gd_rows, ck_rows)
+    extra = {k: v for k, v in (("non_gaap", ng_merged), ("segments", seg_merged), ("guidance", gd_rows),
+                               ("checks", ck_rows)) if v is not None}
     return path, {**merged, **extra}
 
 
@@ -189,5 +199,6 @@ if __name__ == "__main__":
     merged.pop("non_gaap", None)
     merged.pop("segments", None)
     merged.pop("guidance", None)
+    merged.pop("checks", None)
     print(json.dumps({"output": str(path), **{k: f"{len(v['rows'])} rows x {len(v['columns'])} periods"
                                                for k, v in merged.items()}}))

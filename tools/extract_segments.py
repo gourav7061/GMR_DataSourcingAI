@@ -11,27 +11,15 @@ Writes segments.json next to documents.json. Files without segment tables are sk
 Claude call (cost $0) and cached as empty.
 """
 import argparse
-import base64
-import io
 import json
-import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from common import EXTRACT_DIR, call_json, get_client
-from extract_financials import _sheet_text, file_hash, latest_period
+from common import EXTRACT_DIR, call_json, file_hash, get_client
+from extract_financials import UNIT_MULTIPLIERS, latest_period
 
 SEGMENTS_PROMPT_VERSION = 1
 EFFORT = "medium"
-MAX_PAGES = 30
-MIN_TABLE_NUMBERS = 8  # a keyword page must also carry this many comma-grouped numbers to count as a table
-
-KEYWORD_RE = re.compile(
-    r"segment|revenues? by|by (geograph|region|product|channel|market)|disaggregat|breakdown of revenue|"
-    r"geographical information",
-    re.I,
-)
-NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+")
 
 COLUMN = {
     "type": "object",
@@ -71,7 +59,7 @@ SCHEMA = {
                     "name": {"type": "string"},
                     "title": {"type": "string"},
                     "unit_label": {"type": "string"},
-                    "unit_multiplier": {"type": "integer", "enum": [1, 1000, 1000000, 1000000000]},
+                    "unit_multiplier": {"type": "integer", "enum": UNIT_MULTIPLIERS},
                     "columns": {"type": "array", "items": COLUMN},
                     "rows": {"type": "array", "items": ROW},
                 },
@@ -100,88 +88,23 @@ Use the same label for a line across metrics. Omit metrics the report does not d
 
 Columns: one per period ("Q2 2025" for a 3-month quarter, "H1 2025", "9M 2025", "FY2025"), with period_end as YYYY-MM-DD and duration_months (3, 6, 9 or 12). Transpose tables that print periods as rows.
 
-Numbers: plain numbers in the table's own unit, no rescaling. Parentheses or a leading minus mean negative. A dash or blank means null. unit_label is the unit as stated (e.g. "RMB in millions"); unit_multiplier its scale. If tables of one breakdown use different units, convert to the unit of the most granular table and say so in unit_label.
+Numbers: plain numbers in the table's own unit, no rescaling. Parentheses or a leading minus mean negative. A dash or blank means null. unit_label is the unit as stated (e.g. "RMB in millions"); unit_multiplier its scale (100000 for lakh, 10000000 for crore, 10000 for 万, 100000000 for 億/亿). If tables of one breakdown use different units, convert to the unit of the most granular table and say so in unit_label.
 
 Ignore the primary financial statements. If the document has no revenue breakdown, return an empty breakdowns list.
 Accuracy matters more than anything else: copy each figure exactly."""
 
 
-def select_segment_pages(path: Path) -> tuple[bytes | None, int, int]:
-    """PDF holding only pages with segment / revenue-breakdown tables (plus the page after each). None if none."""
-    from pypdf import PdfReader, PdfWriter
+def build_content(path: Path, log=print, client=None) -> tuple[list | None, dict]:
+    """(Claude content blocks or None when the file has no revenue-breakdown tables, page info)."""
+    from page_finder import content_block, language_note
 
-    reader = PdfReader(str(path))
-    total = len(reader.pages)
-    hits = []
-    for i, page in enumerate(reader.pages):
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-        if KEYWORD_RE.search(text) and len(NUMBER_RE.findall(text)) >= MIN_TABLE_NUMBERS:
-            hits.append((len(NUMBER_RE.findall(text)), i))
-    if not hits:
-        return None, 0, total
-    keep = sorted({k for _, i in hits for k in (i, i + 1) if k < total})
-    if len(keep) > MAX_PAGES:
-        # keep the densest tables first
-        keep = set()
-        for _, i in sorted(hits, reverse=True):
-            if len(keep) >= MAX_PAGES:
-                break
-            keep.update(k for k in (i, i + 1) if k < total)
-        keep = sorted(keep)[:MAX_PAGES]
-    writer = PdfWriter()
-    for k in keep:
-        writer.add_page(reader.pages[k])
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue(), len(keep), total
-
-
-def _html_text(path: Path) -> str | None:
-    from bs4 import BeautifulSoup
-
-    text = BeautifulSoup(path.read_bytes(), "html.parser").get_text("\n")
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    matches = list(KEYWORD_RE.finditer(text))
-    if not matches:
-        return None
-    if len(text) <= 400_000:
-        return text
-    spans = []
-    for m in matches:
-        s, e = max(0, m.start() - 3_000), m.start() + 15_000
-        if spans and s <= spans[-1][1]:
-            spans[-1][1] = e
-        else:
-            spans.append([s, e])
-    return "\n...\n".join(text[s:e] for s, e in spans)[:400_000]
-
-
-def build_content(path: Path, log=print) -> list | None:
-    """Claude content blocks, or None when the file has no revenue-breakdown tables (no call needed)."""
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        pdf, kept, total = select_segment_pages(path)
-        if pdf is None:
-            return None
-        log(f"  {path.name}: segment pass sending {kept} of {total} pages")
-        block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                 "data": base64.standard_b64encode(pdf).decode()}}
-    elif suffix in (".htm", ".html"):
-        text = _html_text(path)
-        if text is None:
-            return None
-        block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": text}}
-    elif suffix in (".xlsx", ".xlsm", ".csv"):
-        text = _sheet_text(path)
-        if not KEYWORD_RE.search(text):
-            return None
-        block = {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": text}}
-    else:
-        raise RuntimeError(f"Unsupported file type: {suffix}")
-    return [block, {"type": "text", "text": "Extract every revenue breakdown."}]
+    block, info = content_block(path, "segments", client, log=log)
+    if block is None:
+        return None, info
+    if path.suffix.lower() == ".pdf":
+        log(f"  {path.name}: segment pass sending {len(info['pages'])} of {info['total']} pages")
+    text = "Extract every revenue breakdown." + language_note(info["profile"])
+    return [block, {"type": "text", "text": text}], info
 
 
 def _with_source(data: dict, doc: dict) -> dict:
@@ -201,10 +124,16 @@ def extract_segments_one(doc: dict, client=None, force: bool = False, log=print)
     cache = EXTRACT_DIR / f"{file_hash(path)}_segments_v{SEGMENTS_PROMPT_VERSION}.json"
     if cache.exists() and not force:
         data = json.loads(cache.read_text(encoding="utf-8"))
-        return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        from page_finder import PAGE_RULES_VERSION, has_candidates
+
+        # an empty result from an older, narrower page filter: look again when pages are now found
+        if (data["breakdowns"] or data.get("page_rules", 0) >= PAGE_RULES_VERSION
+                or not has_candidates(path, "segments")):
+            return {**_with_source(data, doc), "cost_usd": 0.0, "cached": True}
+        log(f"  {name}: earlier run found no revenue breakdowns; the page finder now finds candidate pages")
     if path.suffix.lower() == ".xls":
         raise RuntimeError("Old .xls files aren't supported. Open it in Excel and save as .xlsx.")
-    content = build_content(path, log)
+    content, info = build_content(path, log, client)
     if content is None:
         data, cost = {"company": "", "currency": "", "breakdowns": []}, 0.0
         log(f"No revenue breakdown tables in {name}")
@@ -212,11 +141,15 @@ def extract_segments_one(doc: dict, client=None, force: bool = False, log=print)
         client = client or get_client()
         log(f"Extracting revenue segments from {name}...")
         data, cost = call_json(client, content, SCHEMA, effort=EFFORT, system=SYSTEM)
+        cost += info["cost_usd"]
         for b in data["breakdowns"]:
             n = len(b["columns"])
             for row in b["rows"]:
                 row["values"] = (row["values"] + [None] * n)[:n]
         log(f"Done segments {name}: {', '.join(b['name'] for b in data['breakdowns']) or 'none'} (${cost:.2f})")
+    from page_finder import PAGE_RULES_VERSION
+
+    data["page_rules"] = PAGE_RULES_VERSION  # an empty result made with these rules is final
     cache.write_text(json.dumps(data, indent=1), encoding="utf-8")
     return {**_with_source(data, doc), "cost_usd": cost, "cached": False}
 

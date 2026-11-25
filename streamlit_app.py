@@ -21,6 +21,7 @@ from extract_segments import extract_segments_one  # noqa: E402
 from segments_excel import EMPTY_MSG as SEG_EMPTY_MSG, SEGMENTS_SHEET, sheet_rows as segment_rows  # noqa: E402
 from extract_guidance import extract_guidance_one  # noqa: E402
 from guidance_excel import COLUMNS as GD_COLUMNS, EMPTY_MSG as GD_EMPTY_MSG, GUIDANCE_SHEET  # noqa: E402
+from checks import CHECKS_SHEET, COLUMNS as CK_COLUMNS  # noqa: E402
 
 UPLOAD_TYPES = ["pdf", "xlsx", "xlsm", "csv", "htm", "html"]
 # the IR-URL mode needs a visible browser window, which cloud hosts (Linux, no display) can't open
@@ -166,8 +167,26 @@ def show_results():
         st.warning(f"Revenue segments from {label} were not extracted: {err}")
     for label, err in res.get("gd_failed", []):
         st.warning(f"Guidance from {label} was not extracted: {err}")
-    tabs = st.tabs(list(SHEETS.values()) + list(NG_SHEETS.values()) + [SEGMENTS_SHEET, GUIDANCE_SHEET])
-    gd_rows, gd_tab = res["merged"].get("guidance") or [], tabs[-1]
+    ck_rows = res["merged"].get("checks") or []
+    flagged = {}
+    for r in ck_rows:
+        if r["Result"] in ("FAIL", "MISSING"):
+            flagged.setdefault(r["File"] or "All files", []).append(f"{r['Statement']}: {r['Check']}"
+                                                                     + (f" ({r['Column']})" if r["Column"] else ""))
+    for file, items in flagged.items():
+        st.warning(f"Please verify {file}: " + "; ".join(dict.fromkeys(items)) + ". See the Checks tab.")
+    tabs = st.tabs(list(SHEETS.values()) + list(NG_SHEETS.values()) + [SEGMENTS_SHEET, GUIDANCE_SHEET, CHECKS_SHEET])
+    ck_tab = tabs[-1]
+    if not ck_rows:
+        ck_tab.info("No statements were extracted, so there is nothing to check.")
+    else:
+        ck_tab.caption("Automatic checks: each statement is present and its totals add up. "
+                       "FAIL or MISSING means verify that figure against the report; n/a means the rows needed "
+                       "for the check were not found.")
+        ck_tab.dataframe(pd.DataFrame([[r[c] for c in CK_COLUMNS] for r in ck_rows], columns=CK_COLUMNS),
+                         hide_index=True, use_container_width=True, height=600,
+                         column_config={"Detail": st.column_config.TextColumn(width="large")})
+    gd_rows, gd_tab = res["merged"].get("guidance") or [], tabs[-2]
     if not gd_rows:
         gd_tab.info(GD_EMPTY_MSG)
     else:
@@ -235,7 +254,8 @@ with upload_tab:
         st.caption(f"{len(docs)} file{'s' if len(docs) != 1 else ''}. Rough cost: about \\$0.10-\\$0.40 per results "
                    f"announcement, more for full annual reports, plus about \\$0.05-\\$0.25 for non-GAAP "
                    f"reconciliations, \\$0.10-\\$0.30 for revenue segments and \\$0.10-\\$0.30 for guidance "
-                   f"where present. "
+                   f"where present. Scanned or non-English reports add about \\$0.01-\\$0.30 for the AI page "
+                   f"finder; a statement that fails its checks is retried once (about \\$0.15-\\$0.40). "
                    f"Files extracted before are free. "
                    f"The period of each file is detected automatically.")
     if st.button("Extract", type="primary", disabled=not docs, key="extract_up"):
@@ -281,6 +301,8 @@ def url_mode():
         st.caption(f"{len(selected)} selected. Rough cost: about \\$0.10-\\$0.40 per results announcement, "
                    f"more for full annual reports, plus about \\$0.05-\\$0.25 for non-GAAP reconciliations "
                    f"\\$0.10-\\$0.30 for revenue segments and \\$0.10-\\$0.30 for guidance where present. "
+                   f"Scanned or non-English reports add about \\$0.01-\\$0.30 for the AI page finder; a statement "
+                   f"that fails its checks is retried once (about \\$0.15-\\$0.40). "
                    f"Cached extractions are free.")
 
         if st.button("2. Download and extract", type="primary", disabled=not selected):
